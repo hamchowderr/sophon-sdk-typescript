@@ -31,6 +31,29 @@ export SOPHON_BASE_URL=https://api.liqhtworks.xyz
 Keep API keys on the server. Do not ship them in browser bundles, mobile apps,
 public repos, logs, or analytics events.
 
+### Scope keys to least privilege
+
+Issue a **separate key per integration** so you can revoke one without breaking
+the others, and grant each key only the scopes it needs (for example, an
+encode-only worker does not need webhook-management or billing access). Scope a
+key from the **API keys** screen at <https://sophon.rs/account/general> when you
+create it.
+
+### Rotate keys
+
+1. Create a new key in the dashboard.
+2. Deploy it to your environment (`SOPHON_API_KEY`) alongside the old one.
+3. Confirm traffic is flowing on the new key, then **revoke the old key** in the
+   dashboard.
+
+Rotate immediately if a key is ever exposed (committed to a repo, printed to a
+log, leaked in a bug report). Keys are billing identities — a leaked key can run
+up encoding charges on your account.
+
+> The SDK never logs your key, never puts it in a URL, and the `Sophon` facade
+> refuses a plaintext `http://` base URL by default (set `allowInsecure: true`
+> only for local development).
+
 ## Quick Start
 
 This is the smallest complete server-side flow: upload a local video, create an
@@ -162,6 +185,15 @@ fixes, helper-layer improvements, and additive types. Once we cut
 `v1.0.0`, regular SemVer applies and breaking changes only land on
 major bumps. See [`CHANGELOG.md`](./CHANGELOG.md) for the per-release
 log.
+
+## Security & acceptable use
+
+Found a vulnerability? Please report it privately — see [`SECURITY.md`](./SECURITY.md).
+Do not open a public issue for security reports.
+
+Your use of the SOPHON API is governed by the SOPHON Terms of Service and
+Acceptable Use Policy (illegal content, CSAM, and copyright-infringing material
+are prohibited). See <https://sophon.rs> for the current terms.
 
 ## License
 

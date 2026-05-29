@@ -8,7 +8,7 @@
 //   const final = await sophon.jobs.waitFor(job.id);
 //   const out = await sophon.jobs.downloadOutput(final.id);
 
-import { Configuration, type ConfigurationParameters, type Middleware } from "../runtime";
+import { BASE_PATH, Configuration, type ConfigurationParameters, type Middleware } from "../runtime";
 import { UploadsApi } from "../apis/UploadsApi";
 import { JobsApi } from "../apis/JobsApi";
 import { WebhooksApi } from "../apis/WebhooksApi";
@@ -47,6 +47,11 @@ export interface SophonOptions extends Omit<ConfigurationParameters, "accessToke
   /** Enable typed-error rewriting (AuthenticationError, RateLimitError, …).
    *  Default: on. */
   typedErrors?: boolean;
+  /** Allow a plaintext `http://` `basePath`. Default `false`: the SDK throws
+   *  rather than send your `Authorization: Bearer` key over an unencrypted
+   *  connection. Set `true` only for local development against an http origin;
+   *  doing so logs a loud warning on every client construction. */
+  allowInsecure?: boolean;
 }
 
 /** Top-level entry point. */
@@ -64,9 +69,12 @@ export class Sophon {
       retry = true,
       timeoutMs = 60_000,
       typedErrors = true,
+      allowInsecure = false,
       middleware: userMiddleware = [],
       ...rest
     } = options;
+
+    assertSecureBasePath(rest.basePath ?? BASE_PATH, allowInsecure);
 
     const middleware: Middleware[] = [...userMiddleware];
     if (timeoutMs !== false && Number.isFinite(timeoutMs)) {
@@ -128,4 +136,26 @@ export class SophonJobs {
   ): Promise<Uint8Array> {
     return downloadJobOutputBytes({ ...params, config: this.config, jobId });
   }
+}
+
+/**
+ * Refuse a plaintext `http://` base URL unless the caller explicitly opts in.
+ * Sending an `Authorization: Bearer` API key over an unencrypted connection
+ * exposes it to anyone on the network path. `https://`, relative, and
+ * non-`http` schemes pass through untouched.
+ */
+function assertSecureBasePath(basePath: string, allowInsecure: boolean): void {
+  if (!/^http:\/\//i.test(basePath.trim())) return;
+  if (!allowInsecure) {
+    throw new Error(
+      `Sophon: refusing to use insecure base URL "${basePath}". Your API key ` +
+        `would be sent in cleartext. Use https://, or set { allowInsecure: true } ` +
+        `if you really mean to talk to a local http origin.`,
+    );
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    `Sophon: WARNING — using insecure http base URL "${basePath}". Your API key ` +
+      `is sent in cleartext. Never do this against a production endpoint.`,
+  );
 }

@@ -1,0 +1,26 @@
+# Keep dependencies and GitHub Actions current. Security advisories are
+# auto-PR'd by Dependabot regardless of schedule.
+version: 2
+updates:
+  # npm: the SDK has zero runtime deps today; this keeps the `typescript`
+  # devDependency (and any future deps) patched.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # GitHub Actions used by the publish/CI workflow.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(ci)"

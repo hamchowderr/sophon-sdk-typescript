@@ -19,8 +19,10 @@ export interface VerifyWebhookSignatureParams {
   signatureHeader: string | null | undefined;
   /** Value of `X-Turbo-Timestamp`. */
   timestampHeader: string | null | undefined;
-  /** Webhook secret returned by `POST /v1/webhooks`. */
-  secret: string;
+  /** Webhook secret returned by `POST /v1/webhooks`. During a signing-key
+   *  rotation you can pass several candidate secrets; the delivery is accepted
+   *  if it verifies against ANY of them (constant-time per candidate). */
+  secret: string | string[];
   /** Maximum acceptable clock skew in ms. Default 5 min. Set 0 to disable. */
   replayWindowMs?: number;
   /** Override "now" for deterministic tests. */
@@ -90,22 +92,34 @@ export async function verifyWebhookSignature(
     bodyBytes,
   );
 
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
+  const secrets = (Array.isArray(secret) ? secret : [secret]).filter(
+    (s) => typeof s === "string" && s.length > 0,
   );
-  const expected = new Uint8Array(
-    // TS 5.7+ tightened BufferSource to require ArrayBufferView<ArrayBuffer>;
-    // our concatenated Uint8Array is backed by an ArrayBuffer at runtime.
-    await crypto.subtle.sign("HMAC", key, payload as BufferSource),
-  );
-
-  if (!constantTimeEqual(delivered, expected)) {
-    throw new WebhookSignatureError("signature_mismatch");
+  if (secrets.length === 0) {
+    throw new WebhookSignatureError("signature_mismatch", "no webhook secret provided");
   }
+
+  // Accept the delivery if it verifies against ANY candidate secret — this is
+  // what makes overlapping-key rotation safe. Each comparison is constant-time;
+  // which secret matched is not signature-revealing, so a first-match return is
+  // fine.
+  for (const candidate of secrets) {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(candidate),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const expected = new Uint8Array(
+      // TS 5.7+ tightened BufferSource to require ArrayBufferView<ArrayBuffer>;
+      // our concatenated Uint8Array is backed by an ArrayBuffer at runtime.
+      await crypto.subtle.sign("HMAC", key, payload as BufferSource),
+    );
+    if (constantTimeEqual(delivered, expected)) return;
+  }
+
+  throw new WebhookSignatureError("signature_mismatch");
 }
 
 function hexToBytes(hex: string): Uint8Array | null {

@@ -6,12 +6,26 @@
 //
 //   1. `GET {basePath}/v1/jobs/{id}/output` with `redirect: "manual"` so we
 //      can read the `Location` header for the 24h presigned URL.
-//   2. `GET <presigned URL>` to actually stream the bytes.
+//   2. `GET <presigned URL>` (one hop only) to actually stream the bytes.
+//
+// Security: the presigned URL is validated against an allowlist before it is
+// fetched — only HTTPS and only Backblaze B2 (or the API origin / a
+// caller-supplied host) are followed, and the presigned fetch uses
+// `redirect: "error"` so the helper is never an open redirect follower. The
+// caller's Authorization header is NOT forwarded to the presigned host.
 //
 // Returns the presigned response so callers can stream into their own storage,
 // `arrayBuffer()` for tests, or pipe through `Response.body` (Web ReadableStream).
 
 import type { Configuration } from "../runtime";
+
+/**
+ * Hosts the output redirect is allowed to point at, in addition to the API
+ * origin. SOPHON serves encoded outputs from Backblaze B2 signed URLs
+ * (`f00X.backblazeb2.com`, `s3.<region>.backblazeb2.com`). A leading `*.`
+ * matches any sub-domain; a bare host matches exactly.
+ */
+export const DEFAULT_ALLOWED_REDIRECT_HOSTS = ["*.backblazeb2.com", "backblazeb2.com"];
 
 export interface DownloadOutputParams {
   /** The Configuration you handed to `JobsApi`. Used for basePath + auth. */
@@ -23,6 +37,11 @@ export interface DownloadOutputParams {
   /** Optional cancellation signal — aborts both the redirect lookup
    *  and the presigned-URL request. */
   signal?: AbortSignal;
+  /** Extra hosts the output redirect may point at, on top of
+   *  {@link DEFAULT_ALLOWED_REDIRECT_HOSTS} and the API origin. Use a leading
+   *  `*.` to allow sub-domains. Pass this only if your deployment serves
+   *  outputs from a non-B2 origin. */
+  allowedRedirectHosts?: string[];
 }
 
 export interface DownloadOutputResult {
@@ -34,6 +53,17 @@ export interface DownloadOutputResult {
   bytes: number | undefined;
 }
 
+/** Thrown when the output redirect points somewhere not on the allowlist. */
+export class UnsafeRedirectError extends Error {
+  override name = "UnsafeRedirectError";
+  readonly target: string;
+  constructor(target: string, message: string) {
+    super(message);
+    this.target = target;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /**
  * Drives the SOPHON two-step output download. Resolves once the presigned
  * URL has returned a successful response; bytes are NOT buffered. Stream
@@ -42,13 +72,23 @@ export interface DownloadOutputResult {
 export async function downloadJobOutput(
   params: DownloadOutputParams,
 ): Promise<DownloadOutputResult> {
-  const { config, jobId, fetchApi, signal } = params;
+  const { config, jobId, fetchApi, signal, allowedRedirectHosts } = params;
   if (!jobId) throw new TypeError("downloadJobOutput: jobId is required");
 
   const doFetch: typeof fetch = (fetchApi ?? config.fetchApi ?? fetch) as typeof fetch;
   const base = config.basePath.replace(/\/+$/, "");
+  // The API origin is always allowed (outputs may be served same-origin), plus
+  // B2 and any caller-supplied hosts.
+  const apiHost = safeHost(base);
+  const allowed = [
+    ...DEFAULT_ALLOWED_REDIRECT_HOSTS,
+    ...(apiHost ? [apiHost] : []),
+    ...(allowedRedirectHosts ?? []),
+  ];
+
   const headers: Record<string, string> = {};
-  // Reuse the Configuration's accessToken (bearer API key).
+  // Reuse the Configuration's accessToken (bearer API key). This is sent ONLY
+  // to the API origin below — never forwarded to the presigned host.
   const tokenAccessor = (config as any).accessToken;
   if (tokenAccessor) {
     const t =
@@ -66,8 +106,10 @@ export async function downloadJobOutput(
   });
 
   // Fetch may either return status 302 (with Location header) or already
-  // follow the redirect depending on runtime semantics. Handle both.
+  // follow the redirect depending on runtime semantics. Handle both — and in
+  // the auto-followed case, validate the host the bytes actually came from.
   if (redirect.ok) {
+    assertAllowedRedirect(redirect.url, allowed);
     const len = redirect.headers.get("content-length");
     return { response: redirect, url: redirect.url, bytes: len ? Number(len) : undefined };
   }
@@ -79,7 +121,11 @@ export async function downloadJobOutput(
     );
   }
   const presignedUrl = new URL(location, base).toString();
-  const download = await doFetch(presignedUrl, { method: "GET", signal });
+  assertAllowedRedirect(presignedUrl, allowed);
+
+  // `redirect: "error"` — follow EXACTLY this one hop. If the presigned host
+  // tries to bounce us elsewhere, fail loudly instead of open-following.
+  const download = await doFetch(presignedUrl, { method: "GET", redirect: "error", signal });
   if (!download.ok) {
     throw new Error(
       `downloadJobOutput: presigned URL fetch failed (${download.status}) for job ${jobId}`,
@@ -100,4 +146,51 @@ export async function downloadJobOutputBytes(
   const { response } = await downloadJobOutput(params);
   const buf = await response.arrayBuffer();
   return new Uint8Array(buf);
+}
+
+/** Parse a host from a URL string, returning undefined if it can't be parsed. */
+function safeHost(url: string): string | undefined {
+  try {
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Throws {@link UnsafeRedirectError} unless `target` is HTTPS and its host is
+ * on `allowed` (exact match, or sub-domain match for `*.`-prefixed entries).
+ */
+function assertAllowedRedirect(target: string, allowed: string[]): void {
+  let url: URL;
+  try {
+    url = new URL(target);
+  } catch {
+    throw new UnsafeRedirectError(target, `downloadJobOutput: malformed redirect target "${target}"`);
+  }
+  if (url.protocol !== "https:") {
+    throw new UnsafeRedirectError(
+      target,
+      `downloadJobOutput: refusing non-HTTPS redirect target "${target}"`,
+    );
+  }
+  const host = url.host.toLowerCase();
+  if (!hostMatchesAny(host, allowed)) {
+    throw new UnsafeRedirectError(
+      target,
+      `downloadJobOutput: redirect host "${host}" is not on the allowlist ` +
+        `(${allowed.join(", ")}). Pass allowedRedirectHosts to permit it.`,
+    );
+  }
+}
+
+function hostMatchesAny(host: string, patterns: string[]): boolean {
+  return patterns.some((raw) => {
+    const pattern = raw.toLowerCase();
+    if (pattern.startsWith("*.")) {
+      const suffix = pattern.slice(1); // ".backblazeb2.com"
+      return host.endsWith(suffix) && host.length > suffix.length;
+    }
+    return host === pattern;
+  });
 }

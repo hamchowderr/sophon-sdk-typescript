@@ -3,6 +3,12 @@ node_modules
 typings
 dist
 
+# Secrets & local credentials — never commit. (.env.example stays tracked.)
+.env
+.env.*
+!.env.example
+.npmrc
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
